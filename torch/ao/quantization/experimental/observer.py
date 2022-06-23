@@ -13,40 +13,48 @@ from torch.ao.quantization.experimental.apot_utils import float_to_apot, apot_to
 # when more than one non-uniform method is implemented
 
 class APoTObserver(ObserverBase):
-    max_val: float
     b: int
     k: int
     n: int
-    alpha: float
-    gamma: float
-    level_indices: torch.Tensor
+    alpha: torch.Tensor
+    min_val: torch.Tensor
+    max_val: torch.Tensor
 
     def __init__(
         self,
-        max_val,
         b,
         k,
-            dtype=torch.quint8) -> None:
+            dtype=torch.uint8) -> None:
         super().__init__(dtype)
-        self.max_val = max_val
         self.b = b
         self.k = k
 
-    def calculate_qparams(self, signed):
-        return self._calculate_qparams(signed)
+        self.min_val = torch.tensor([])
+        self.max_val = torch.tensor([])
+
+    # alpha is an optional arg to override alpha from
+    # observer's internal state
+    def calculate_qparams(self, signed, min_val=None, max_val=None):
+        return self._calculate_qparams(signed, min_val, max_val)
 
     r""" Calculates nonuniform quantization parameters according to APoT paper:
     https://arxiv.org/pdf/1909.13144.pdf.
     Arg:
         signed: specifies whether to include signed values in quantization level calculations
+        alpha: optional value that can override internal alpha attribute for testing purposes
     Returns:
         gamma: gamma quantization parameter, defined to ensure that alpha is the maximum of the range
         quantization_levels: non-uniform quantization levels (fp representation)
         level_indices: int representation of quantization_levels indices
     """
-    def _calculate_qparams(self, signed):
+    def _calculate_qparams(self, signed, min_val=None, max_val=None):
+        if min_val is not None:
+            self.min_val = min_val
+        if max_val is not None:
+            self.max_val = max_val
+
         # compute alpha
-        self.alpha = self.max_val
+        self.alpha = torch.max(-self.min_val, self.max_val)
 
         # check for valid inputs of b, k
         assert(self.k and self.k != 0)
@@ -90,7 +98,7 @@ class APoTObserver(ObserverBase):
                 p_sum += float(tens[1])
 
         # assign gamma
-        self.gamma = self.alpha / p_sum
+        gamma = self.alpha / p_sum
 
         # calculate cartesian product
         cartesian_product = list(itertools.product(*p_all))
@@ -104,16 +112,25 @@ class APoTObserver(ObserverBase):
                 sum += ele
             quantization_levels_list.append(sum)
 
-        quantization_levels_gamma = [self.gamma * ele for ele in quantization_levels_list]
+        quantization_levels_gamma = [float(gamma) * ele for ele in quantization_levels_list]
         quantization_levels = torch.tensor(quantization_levels_gamma)
         level_indices = torch.tensor([])
-        quantization_levels, self.level_indices = quantization_levels.sort()
+        quantization_levels, level_indices = quantization_levels.sort()
 
-        return (self.gamma, quantization_levels, self.level_indices)
+        return (gamma, quantization_levels, level_indices)
 
     def forward(self, x_orig):
-        r"""Records the running maximum of ``x``."""
-        max_val = self.max_val
+        r"""Records the running minimum and maximum of ``x``."""
+        if x_orig.numel() == 0:
+            return x_orig
+        x = x_orig.detach()
+        min_val, max_val = torch.aminmax(x)
+        if self.min_val.numel():
+            min_val = torch.min(min_val, self.min_val)
+        if self.max_val.numel():
+            max_val = torch.max(max_val, self.max_val)
+        self.min_val = min_val
+        self.max_val = max_val
         return x_orig
 
     def quant_levels_visualization(self, obs_result, filename):
